@@ -292,6 +292,8 @@ class DefaultMayaHandler:
 
         This should be called after the scene file is opened to override
         the scene's embedded OCIO config path with the remapped path.
+        Also sets the OCIO environment variable so that renderers which
+        read it directly (e.g. V-Ray) will pick up the correct config.
 
         Args:
             data (dict): The data given from the Adaptor. Keys expected: ['ocio_config_file']
@@ -307,6 +309,9 @@ class DefaultMayaHandler:
         if not os.path.isfile(ocio_path):
             print(f"WARNING: OCIO config file not found: '{ocio_path}'", flush=True)
             return
+
+        # Set the OCIO environment variable for renderers that read it directly
+        os.environ["OCIO"] = ocio_path
 
         # Set the OCIO config file path in Maya's color management preferences
         print(f"Setting OCIO config: '{ocio_path}'", flush=True)
