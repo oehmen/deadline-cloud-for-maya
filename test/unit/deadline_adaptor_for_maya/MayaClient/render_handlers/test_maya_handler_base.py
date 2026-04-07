@@ -309,14 +309,18 @@ class TestSetOcioConfigFile:
     @patch("os.path.isfile")
     @patch.object(DirectoryMapping, "get_activated")
     @patch.object(DirectoryMapping, "convert")
+    @patch(
+        "deadline.maya_adaptor.MayaClient.render_handlers.default_maya_handler.maya.cmds.colorManagementPrefs"
+    )
     def test_set_ocio_config_file_with_path_mapping(
         self,
+        mock_color_prefs: Mock,
         mock_convert: Mock,
         mock_get_activated: Mock,
         mock_isfile: Mock,
         mayahandlerbase: DefaultMayaHandler,
     ):
-        """Tests that path mapping is applied and env var + pending path are set"""
+        """Tests that path mapping is applied and env var + prefs + pending path are set"""
         # GIVEN
         mock_get_activated.return_value = True
         mock_convert.return_value = "/mapped/path/config.ocio"
@@ -331,13 +335,20 @@ class TestSetOcioConfigFile:
             # THEN
             mock_convert.assert_called_once_with("/original/path/config.ocio")
             mock_isfile.assert_called_once_with("/mapped/path/config.ocio")
+            mock_color_prefs.assert_called_once_with(
+                e=True, configFilePath="/mapped/path/config.ocio"
+            )
             assert os.environ.get("OCIO") == "/mapped/path/config.ocio"
             assert mayahandlerbase._pending_ocio_path == "/mapped/path/config.ocio"
 
     @patch("os.path.isfile")
     @patch.object(DirectoryMapping, "get_activated")
+    @patch(
+        "deadline.maya_adaptor.MayaClient.render_handlers.default_maya_handler.maya.cmds.colorManagementPrefs"
+    )
     def test_set_ocio_config_file_without_path_mapping(
         self,
+        mock_color_prefs: Mock,
         mock_get_activated: Mock,
         mock_isfile: Mock,
         mayahandlerbase: DefaultMayaHandler,
@@ -353,13 +364,20 @@ class TestSetOcioConfigFile:
 
             # THEN
             mock_isfile.assert_called_once_with("/path/to/config.ocio")
+            mock_color_prefs.assert_called_once_with(
+                e=True, configFilePath="/path/to/config.ocio"
+            )
             assert os.environ.get("OCIO") == "/path/to/config.ocio"
             assert mayahandlerbase._pending_ocio_path == "/path/to/config.ocio"
 
     @patch("os.path.isfile")
     @patch.object(DirectoryMapping, "get_activated")
+    @patch(
+        "deadline.maya_adaptor.MayaClient.render_handlers.default_maya_handler.maya.cmds.colorManagementPrefs"
+    )
     def test_set_ocio_config_file_sets_ocio_env_var(
         self,
+        mock_color_prefs: Mock,
         mock_get_activated: Mock,
         mock_isfile: Mock,
         mayahandlerbase: DefaultMayaHandler,

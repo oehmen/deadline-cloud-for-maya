@@ -297,10 +297,10 @@ class DefaultMayaHandler:
         """
         Sets the OCIO config file path for color management.
 
-        This is called before the scene file is opened so that renderers
-        like V-Ray which read the OCIO environment variable at scene-open
-        time will pick up the correct config. The colorManagementPrefs
-        call is deferred to set_scene_file after the scene is opened.
+        This is called before the scene file is opened so that both
+        Maya's color management and renderers like V-Ray (which read
+        the OCIO environment variable) pick up the correct config
+        at scene-open time.
 
         Args:
             data (dict): The data given from the Adaptor. Keys expected: ['ocio_config_file']
@@ -319,6 +319,11 @@ class DefaultMayaHandler:
 
         # Set the OCIO environment variable so renderers pick it up at scene open
         os.environ["OCIO"] = ocio_path
-        # Store for deferred colorManagementPrefs call after scene opens
+
+        # Set Maya's color management prefs before scene open to prevent
+        # Maya from trying to load the unmapped path embedded in the scene file
+        maya.cmds.colorManagementPrefs(e=True, configFilePath=ocio_path)
+
+        # Store path so we can re-apply after scene open (scene open may override)
         self._pending_ocio_path = ocio_path
-        print(f"Setting OCIO env var: '{ocio_path}'", flush=True)
+        print(f"Setting OCIO config: '{ocio_path}'", flush=True)
