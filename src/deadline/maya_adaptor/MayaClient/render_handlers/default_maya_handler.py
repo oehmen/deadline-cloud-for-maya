@@ -56,6 +56,7 @@ class DefaultMayaHandler:
         self.camera_name = None
         self.output_file_prefix = None
         self.render_kwargs = {}
+        self._pending_ocio_path = None
 
     def get_camera_to_render(self, data: dict) -> list[str]:
         # The ls function returns all of the camera shapes, but the cameras themselves are represented by
@@ -279,6 +280,12 @@ class DefaultMayaHandler:
             raise FileNotFoundError(f"The scene file '{file_path}' does not exist")
         maya.cmds.file(file_path, open=True, force=True, ignoreVersion=ignore_version_flag)
 
+        # Apply deferred OCIO config after scene is opened
+        if self._pending_ocio_path:
+            print(f"Setting OCIO config in Maya prefs: '{self._pending_ocio_path}'", flush=True)
+            maya.cmds.colorManagementPrefs(e=True, configFilePath=self._pending_ocio_path)
+            self._pending_ocio_path = None
+
         pre_render_mel = maya.cmds.getAttr("defaultRenderGlobals.preMel")
         if pre_render_mel:
             try:
@@ -290,10 +297,10 @@ class DefaultMayaHandler:
         """
         Sets the OCIO config file path for color management.
 
-        This should be called after the scene file is opened to override
-        the scene's embedded OCIO config path with the remapped path.
-        Also sets the OCIO environment variable so that renderers which
-        read it directly (e.g. V-Ray) will pick up the correct config.
+        This is called before the scene file is opened so that renderers
+        like V-Ray which read the OCIO environment variable at scene-open
+        time will pick up the correct config. The colorManagementPrefs
+        call is deferred to set_scene_file after the scene is opened.
 
         Args:
             data (dict): The data given from the Adaptor. Keys expected: ['ocio_config_file']
@@ -310,9 +317,8 @@ class DefaultMayaHandler:
             print(f"WARNING: OCIO config file not found: '{ocio_path}'", flush=True)
             return
 
-        # Set the OCIO environment variable for renderers that read it directly
+        # Set the OCIO environment variable so renderers pick it up at scene open
         os.environ["OCIO"] = ocio_path
-
-        # Set the OCIO config file path in Maya's color management preferences
-        print(f"Setting OCIO config: '{ocio_path}'", flush=True)
-        maya.cmds.colorManagementPrefs(e=True, configFilePath=ocio_path)
+        # Store for deferred colorManagementPrefs call after scene opens
+        self._pending_ocio_path = ocio_path
+        print(f"Setting OCIO env var: '{ocio_path}'", flush=True)
