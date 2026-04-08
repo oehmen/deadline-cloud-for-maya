@@ -22,9 +22,13 @@ _FRAME_RE = re.compile("#+")
 # Per the spec, there should be no whitespace around '=', but we allow it for robustness.
 _VRSCENE_NAMED_PARAM_RE = re.compile(r'(\w+)\s*=\s*"([^"]+)"\s*;')
 
-# Matches a plugin block header: "PluginType instanceName {"
-# Works whether the block content follows on the same line or the next.
-_VRSCENE_PLUGIN_HEADER_RE = re.compile(r'^(\w+)\s+\S+\s*\{(.*)$')
+# Matches a complete plugin block: captures plugin type and block body.
+# Handles both multi-line and compact single-line blocks.
+# Uses re.DOTALL so '.' matches newlines within the non-greedy body match.
+_VRSCENE_PLUGIN_BLOCK_RE = re.compile(r'(\w+)\s+\S+\s*\{(.*?)\}', re.DOTALL)
+
+# Matches #include directives: #include "path/to/file.vrscene"
+_VRSCENE_INCLUDE_RE = re.compile(r'#include\s+"([^"]+)"')
 
 # Known vrscene plugin types and their attributes that contain file paths.
 # This covers the most common cases: textures, geometry proxies, IES lights, etc.
@@ -333,6 +337,11 @@ class AssetIntrospector:
                 file="path/to/texture.exr";
             }
 
+        Instead of parsing line-by-line, we read the entire file and use a single
+        regex pass to find all plugin blocks and extract string parameters from them.
+        This is significantly faster for large vrscene files that contain huge amounts
+        of geometry data (vertices, normals, faces) which we can skip entirely.
+
         We use two strategies:
         1. Targeted: Track known plugin types and their file attributes
         2. Broad: For any string parameter value that looks like a file path with a
@@ -374,9 +383,6 @@ class AssetIntrospector:
             ".vismat",
         }
 
-        current_plugin_type: str | None = None
-        in_plugin_block = False
-
         def _resolve_and_add(value: str) -> None:
             """Resolve a file path value and add it to linked_files."""
             file_path = value
@@ -405,95 +411,49 @@ class AssetIntrospector:
                 # after path mapping
                 linked_files.add(Path(file_path))
 
-        def _extract_assets_from_block(plugin_type: str, block_content: str) -> None:
-            """Extract file path references from a plugin block's content string."""
-            for param_name, value in _VRSCENE_NAMED_PARAM_RE.findall(block_content):
-                is_known_file_attr = False
+        try:
+            with open(vrscene_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except (OSError, IOError) as e:
+            print(f"Warning: Could not read VRayScene file {vrscene_path}: {e}")
+            return linked_files
 
-                if plugin_type in _VRSCENE_FILE_PLUGINS:
-                    if param_name in _VRSCENE_FILE_PLUGINS[plugin_type]:
-                        is_known_file_attr = True
+        # Strip single-line comments (// ...) before parsing.
+        # The vrscene format only supports C++ style single-line comments.
+        content = re.sub(r'//[^\n]*', '', content)
+
+        # Process #include directives
+        for include_match in _VRSCENE_INCLUDE_RE.finditer(content):
+            include_path = include_match.group(1)
+            if not os.path.isabs(include_path):
+                include_path = os.path.join(vrscene_dir, include_path)
+            include_path = os.path.normpath(include_path)
+            if os.path.isfile(include_path):
+                linked_files.add(Path(include_path))
+                linked_files.update(self._parse_vrscene_file(include_path))
+
+        # Single-pass: find all plugin blocks and extract string params from each
+        for block_match in _VRSCENE_PLUGIN_BLOCK_RE.finditer(content):
+            plugin_type = block_match.group(1)
+            block_body = block_match.group(2)
+
+            # Only run the param regex on blocks that could contain file references:
+            # either a known file-bearing plugin type, or a block whose body contains
+            # a quote character (string params use quotes, geometry data doesn't).
+            known_plugin = plugin_type in _VRSCENE_FILE_PLUGINS
+            if not known_plugin and '"' not in block_body:
+                continue
+
+            for param_name, value in _VRSCENE_NAMED_PARAM_RE.findall(block_body):
+                is_known_file_attr = (
+                    known_plugin and param_name in _VRSCENE_FILE_PLUGINS[plugin_type]
+                )
 
                 _, ext = os.path.splitext(value.lower())
                 has_asset_extension = ext in _asset_extensions
 
                 if is_known_file_attr or has_asset_extension:
                     _resolve_and_add(value)
-
-        try:
-            with open(vrscene_path, "r", encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    stripped = line.strip()
-
-                    # Skip comments and empty lines
-                    if not stripped or stripped.startswith("//"):
-                        continue
-
-                    # Handle #include directives (vrscene supports C-style includes)
-                    if stripped.startswith("#include"):
-                        match = re.match(r'#include\s+"([^"]+)"', stripped)
-                        if match:
-                            include_path = match.group(1)
-                            if not os.path.isabs(include_path):
-                                include_path = os.path.join(vrscene_dir, include_path)
-                            include_path = os.path.normpath(include_path)
-                            if os.path.isfile(include_path):
-                                linked_files.add(Path(include_path))
-                                # Recursively parse included vrscene files
-                                linked_files.update(self._parse_vrscene_file(include_path))
-                        continue
-
-                    # Process the line content, which may contain multiple plugin blocks
-                    # (compact vrscene exports can put everything on one line)
-                    while stripped:
-                        if not in_plugin_block:
-                            # Look for a plugin block header
-                            header_match = _VRSCENE_PLUGIN_HEADER_RE.match(stripped)
-                            if not header_match:
-                                break
-
-                            current_plugin_type = header_match.group(1)
-                            remainder = header_match.group(2)
-
-                            if "}" in remainder:
-                                # Compact single-line block: PluginType name {params;}
-                                block_body = remainder[: remainder.index("}")]
-                                _extract_assets_from_block(current_plugin_type, block_body)
-                                current_plugin_type = None
-                                # Continue processing any remaining content after the block
-                                stripped = remainder[remainder.index("}") + 1 :].strip()
-                                continue
-                            else:
-                                # Multi-line block starts here
-                                in_plugin_block = True
-                                if remainder.strip():
-                                    _extract_assets_from_block(
-                                        current_plugin_type, remainder
-                                    )
-                                break
-                        else:
-                            # Inside a multi-line plugin block
-                            if "}" in stripped:
-                                before_close = stripped[: stripped.index("}")]
-                                if before_close.strip() and current_plugin_type:
-                                    _extract_assets_from_block(
-                                        current_plugin_type, before_close
-                                    )
-                                current_plugin_type = None
-                                in_plugin_block = False
-                                # Check for more blocks after the closing brace
-                                stripped = stripped[stripped.index("}") + 1 :].strip()
-                                continue
-                            else:
-                                # Regular line inside a multi-line block
-                                if current_plugin_type:
-                                    _extract_assets_from_block(
-                                        current_plugin_type, stripped
-                                    )
-                                break
-
-        except (OSError, IOError) as e:
-            print(f"Warning: Could not read VRayScene file {vrscene_path}: {e}")
 
         return linked_files
 
