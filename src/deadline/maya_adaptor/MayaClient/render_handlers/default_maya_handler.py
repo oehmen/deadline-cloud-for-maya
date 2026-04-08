@@ -278,12 +278,26 @@ class DefaultMayaHandler:
         file_path = data.get("scene_file", "")
         if not os.path.isfile(file_path):
             raise FileNotFoundError(f"The scene file '{file_path}' does not exist")
+
+        # If we have a pending OCIO path, temporarily disable color management
+        # before opening the scene to prevent Maya from trying to load the
+        # unmapped OCIO path embedded in the scene file
+        cm_was_disabled = False
+        if self._pending_ocio_path:
+            try:
+                maya.cmds.colorManagementPrefs(e=True, cmEnabled=False)
+                cm_was_disabled = True
+            except Exception as e:
+                print(f"Warning: Could not disable color management before scene open: {e}")
+
         maya.cmds.file(file_path, open=True, force=True, ignoreVersion=ignore_version_flag)
 
-        # Apply deferred OCIO config after scene is opened
+        # Re-enable color management with the correct OCIO config path
         if self._pending_ocio_path:
             print(f"Setting OCIO config in Maya prefs: '{self._pending_ocio_path}'", flush=True)
             maya.cmds.colorManagementPrefs(e=True, configFilePath=self._pending_ocio_path)
+            if cm_was_disabled:
+                maya.cmds.colorManagementPrefs(e=True, cmEnabled=True)
             self._pending_ocio_path = None
 
         pre_render_mel = maya.cmds.getAttr("defaultRenderGlobals.preMel")
