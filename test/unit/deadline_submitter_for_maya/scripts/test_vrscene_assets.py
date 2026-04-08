@@ -578,3 +578,53 @@ class TestParseVrsceneFile:
 
         # THEN
         assert Path(os.path.normpath("/nonexistent/dir/wood_<UDIM>.exr")) in result
+
+    def test_parses_compact_single_line_format(self, tmp_path: Path) -> None:
+        """Test parsing vrscene files where plugin blocks are on a single line (compact export)"""
+        # GIVEN
+        tex1 = tmp_path / "AI52_001_Table_Glossiness.png"
+        tex2 = tmp_path / "AI52_001_Table_Diffuse.exr"
+        tex1.touch()
+        tex2.touch()
+
+        vrscene_file = tmp_path / "scene.vrscene"
+        vrscene_file.write_text(
+            f'BitmapBuffer glossiness_map@bitmap {{filter_type=5;filter_blur=1;color_space=2;rgb_color_space="lin_srgb";gamma=1;maya_compatible=1;allow_negative_colors=1;file="{tex1}";load_file=1;ifl_start_frame=0;ifl_playback_rate=1;ifl_end_condition=0;}}'
+            f'BitmapBuffer diffuse_map@bitmap {{filter_type=5;filter_blur=1;color_space=2;rgb_color_space="lin_srgb";gamma=1;maya_compatible=1;allow_negative_colors=1;file="{tex2}";load_file=1;ifl_start_frame=0;ifl_playback_rate=1;ifl_end_condition=0;}}'
+        )
+
+        # WHEN
+        result = assets_module.AssetIntrospector()._parse_vrscene_file(str(vrscene_file))
+
+        # THEN
+        assert Path(os.path.normpath(str(tex1))) in result
+        assert Path(os.path.normpath(str(tex2))) in result
+
+    def test_parses_mixed_compact_and_multiline_format(self, tmp_path: Path) -> None:
+        """Test parsing vrscene files with a mix of compact and multi-line blocks"""
+        # GIVEN
+        tex1 = tmp_path / "compact_texture.png"
+        tex2 = tmp_path / "multiline_texture.exr"
+        proxy = tmp_path / "model.vrmesh"
+        tex1.touch()
+        tex2.touch()
+        proxy.touch()
+
+        vrscene_file = tmp_path / "scene.vrscene"
+        vrscene_file.write_text(
+            f'BitmapBuffer compact_bitmap {{filter_type=5;file="{tex1}";gamma=1;}}\n'
+            f"BitmapBuffer multiline_bitmap {{\n"
+            f'    file="{tex2}";\n'
+            f"    gamma=2.2;\n"
+            f"}}\n"
+            f'GeomMeshFile proxy1 {{file="{proxy}";anim_type=0;}}\n'
+        )
+
+        # WHEN
+        result = assets_module.AssetIntrospector()._parse_vrscene_file(str(vrscene_file))
+
+        # THEN
+        assert len(result) == 3
+        assert Path(os.path.normpath(str(tex1))) in result
+        assert Path(os.path.normpath(str(tex2))) in result
+        assert Path(os.path.normpath(str(proxy))) in result

@@ -17,9 +17,14 @@ import maya.cmds
 _FRAME_RE = re.compile("#+")
 
 # Regex to extract string values from .vrscene plugin parameters.
-# Matches: parameter_name="value"; (the value part, which is a file path)
+# Matches paramName="value"; capturing both the parameter name and value.
 # The vrscene format uses paramName="stringValue"; for string parameters.
-_VRSCENE_STRING_PARAM_RE = re.compile(r'=\s*"([^"]+)"\s*;')
+# Per the spec, there should be no whitespace around '=', but we allow it for robustness.
+_VRSCENE_NAMED_PARAM_RE = re.compile(r'(\w+)\s*=\s*"([^"]+)"\s*;')
+
+# Matches a plugin block header: "PluginType instanceName {"
+# Works whether the block content follows on the same line or the next.
+_VRSCENE_PLUGIN_HEADER_RE = re.compile(r'^(\w+)\s+\S+\s*\{(.*)$')
 
 # Known vrscene plugin types and their attributes that contain file paths.
 # This covers the most common cases: textures, geometry proxies, IES lights, etc.
@@ -372,6 +377,49 @@ class AssetIntrospector:
         current_plugin_type: str | None = None
         in_plugin_block = False
 
+        def _resolve_and_add(value: str) -> None:
+            """Resolve a file path value and add it to linked_files."""
+            file_path = value
+            if not os.path.isabs(file_path):
+                file_path = os.path.join(vrscene_dir, file_path)
+            file_path = os.path.normpath(file_path)
+
+            # Handle <UDIM> tokens by finding all matching tile files
+            if "<UDIM>" in file_path:
+                file_dir = os.path.dirname(file_path)
+                file_base = os.path.basename(file_path).split("<UDIM>")[0]
+                try:
+                    for f in os.listdir(file_dir):
+                        if f.startswith(file_base) and os.path.isfile(
+                            os.path.join(file_dir, f)
+                        ):
+                            linked_files.add(
+                                Path(os.path.normpath(os.path.join(file_dir, f)))
+                            )
+                except (OSError, FileNotFoundError):
+                    linked_files.add(Path(file_path))
+            elif os.path.exists(file_path):
+                linked_files.add(Path(file_path))
+            else:
+                # Still add it - the path might be valid on the render farm
+                # after path mapping
+                linked_files.add(Path(file_path))
+
+        def _extract_assets_from_block(plugin_type: str, block_content: str) -> None:
+            """Extract file path references from a plugin block's content string."""
+            for param_name, value in _VRSCENE_NAMED_PARAM_RE.findall(block_content):
+                is_known_file_attr = False
+
+                if plugin_type in _VRSCENE_FILE_PLUGINS:
+                    if param_name in _VRSCENE_FILE_PLUGINS[plugin_type]:
+                        is_known_file_attr = True
+
+                _, ext = os.path.splitext(value.lower())
+                has_asset_extension = ext in _asset_extensions
+
+                if is_known_file_attr or has_asset_extension:
+                    _resolve_and_add(value)
+
         try:
             with open(vrscene_path, "r", encoding="utf-8", errors="replace") as f:
                 for line in f:
@@ -395,67 +443,54 @@ class AssetIntrospector:
                                 linked_files.update(self._parse_vrscene_file(include_path))
                         continue
 
-                    # Detect plugin block start: "PluginType instanceName {"
-                    if not in_plugin_block and "{" in stripped:
-                        parts = stripped.split()
-                        if len(parts) >= 2:
-                            current_plugin_type = parts[0]
-                            in_plugin_block = True
-                        continue
+                    # Process the line content, which may contain multiple plugin blocks
+                    # (compact vrscene exports can put everything on one line)
+                    while stripped:
+                        if not in_plugin_block:
+                            # Look for a plugin block header
+                            header_match = _VRSCENE_PLUGIN_HEADER_RE.match(stripped)
+                            if not header_match:
+                                break
 
-                    # Detect plugin block end
-                    if stripped == "}":
-                        current_plugin_type = None
-                        in_plugin_block = False
-                        continue
+                            current_plugin_type = header_match.group(1)
+                            remainder = header_match.group(2)
 
-                    if not in_plugin_block:
-                        continue
-
-                    # Extract string parameter values
-                    matches = _VRSCENE_STRING_PARAM_RE.findall(line)
-                    for value in matches:
-                        is_known_file_attr = False
-
-                        # Strategy 1: Check if this is a known file attribute
-                        if current_plugin_type in _VRSCENE_FILE_PLUGINS:
-                            param_name = line.split("=")[0].strip() if "=" in line else ""
-                            if param_name in _VRSCENE_FILE_PLUGINS[current_plugin_type]:
-                                is_known_file_attr = True
-
-                        # Strategy 2: Check if the value looks like a file path
-                        _, ext = os.path.splitext(value.lower())
-                        has_asset_extension = ext in _asset_extensions
-
-                        if is_known_file_attr or has_asset_extension:
-                            file_path = value
-                            # Resolve relative paths against the vrscene file's directory
-                            if not os.path.isabs(file_path):
-                                file_path = os.path.join(vrscene_dir, file_path)
-                            file_path = os.path.normpath(file_path)
-
-                            # Handle <UDIM> tokens by finding all matching tile files
-                            if "<UDIM>" in file_path:
-                                file_dir = os.path.dirname(file_path)
-                                file_base = os.path.basename(file_path).split("<UDIM>")[0]
-                                try:
-                                    for f in os.listdir(file_dir):
-                                        if f.startswith(file_base) and os.path.isfile(
-                                            os.path.join(file_dir, f)
-                                        ):
-                                            linked_files.add(
-                                                Path(os.path.normpath(os.path.join(file_dir, f)))
-                                            )
-                                except (OSError, FileNotFoundError):
-                                    # Directory may not exist locally; add the pattern path
-                                    # so it can be resolved on the farm
-                                    linked_files.add(Path(file_path))
-                            elif os.path.exists(file_path):
-                                linked_files.add(Path(file_path))
+                            if "}" in remainder:
+                                # Compact single-line block: PluginType name {params;}
+                                block_body = remainder[: remainder.index("}")]
+                                _extract_assets_from_block(current_plugin_type, block_body)
+                                current_plugin_type = None
+                                # Continue processing any remaining content after the block
+                                stripped = remainder[remainder.index("}") + 1 :].strip()
+                                continue
                             else:
-                                # Still add it - the path might be valid on the render farm
-                                # after path mapping
-                                linked_files.add(Path(file_path))
+                                # Multi-line block starts here
+                                in_plugin_block = True
+                                if remainder.strip():
+                                    _extract_assets_from_block(
+                                        current_plugin_type, remainder
+                                    )
+                                break
+                        else:
+                            # Inside a multi-line plugin block
+                            if "}" in stripped:
+                                before_close = stripped[: stripped.index("}")]
+                                if before_close.strip() and current_plugin_type:
+                                    _extract_assets_from_block(
+                                        current_plugin_type, before_close
+                                    )
+                                current_plugin_type = None
+                                in_plugin_block = False
+                                # Check for more blocks after the closing brace
+                                stripped = stripped[stripped.index("}") + 1 :].strip()
+                                continue
+                            else:
+                                # Regular line inside a multi-line block
+                                if current_plugin_type:
+                                    _extract_assets_from_block(
+                                        current_plugin_type, stripped
+                                    )
+                                break
 
         except (OSError, IOError) as e:
             print(f"Warning: Could not read VRayScene file {vrscene_path}: {e}")
