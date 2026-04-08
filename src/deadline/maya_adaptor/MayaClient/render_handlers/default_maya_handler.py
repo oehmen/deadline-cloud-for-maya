@@ -279,25 +279,18 @@ class DefaultMayaHandler:
         if not os.path.isfile(file_path):
             raise FileNotFoundError(f"The scene file '{file_path}' does not exist")
 
-        # If we have a pending OCIO path, temporarily disable color management
-        # before opening the scene to prevent Maya from trying to load the
-        # unmapped OCIO path embedded in the scene file
-        cm_was_disabled = False
-        if self._pending_ocio_path:
-            try:
-                maya.cmds.colorManagementPrefs(e=True, cmEnabled=False)
-                cm_was_disabled = True
-            except Exception as e:
-                print(f"Warning: Could not disable color management before scene open: {e}")
+        # If we have a pending OCIO path and the scene is a .ma (text) file,
+        # rewrite the OCIO config path in the file before opening to prevent
+        # Maya from trying to load the unmapped path embedded in the scene
+        if self._pending_ocio_path and file_path.lower().endswith(".ma"):
+            self._patch_ocio_path_in_scene_file(file_path, self._pending_ocio_path)
 
         maya.cmds.file(file_path, open=True, force=True, ignoreVersion=ignore_version_flag)
 
-        # Re-enable color management with the correct OCIO config path
+        # Re-apply OCIO config after scene open as a safety net
         if self._pending_ocio_path:
             print(f"Setting OCIO config in Maya prefs: '{self._pending_ocio_path}'", flush=True)
             maya.cmds.colorManagementPrefs(e=True, configFilePath=self._pending_ocio_path)
-            if cm_was_disabled:
-                maya.cmds.colorManagementPrefs(e=True, cmEnabled=True)
             self._pending_ocio_path = None
 
         pre_render_mel = maya.cmds.getAttr("defaultRenderGlobals.preMel")
@@ -306,6 +299,38 @@ class DefaultMayaHandler:
                 maya.mel.eval(pre_render_mel)
             except Exception as e:
                 print("Warning: preMel Failed: %s" % e)
+
+    def _patch_ocio_path_in_scene_file(self, file_path: str, ocio_path: str) -> None:
+        """
+        Rewrites the OCIO config file path in a .ma scene file so that Maya
+        loads the correct (mapped) path when opening the scene, avoiding
+        errors from unmapped paths.
+        """
+        try:
+            with open(file_path, "r") as f:
+                content = f.read()
+
+            # Match the .cfp attribute in defaultColorMgtGlobals which stores the OCIO path
+            # Format: setAttr ".cfp" -type "string" "<path>";
+            import re
+
+            pattern = r'(setAttr\s+"\.cfp"\s+-type\s+"string"\s+")([^"]*)(";)'
+            match = re.search(pattern, content)
+            if match:
+                old_path = match.group(2)
+                if old_path != ocio_path:
+                    new_content = content.replace(
+                        match.group(0),
+                        f'{match.group(1)}{ocio_path}{match.group(3)}',
+                    )
+                    with open(file_path, "w") as f:
+                        f.write(new_content)
+                    print(
+                        f"Patched OCIO path in scene file: '{old_path}' -> '{ocio_path}'",
+                        flush=True,
+                    )
+        except Exception as e:
+            print(f"Warning: Could not patch OCIO path in scene file: {e}", flush=True)
 
     def set_ocio_config_file(self, data: dict) -> None:
         """
