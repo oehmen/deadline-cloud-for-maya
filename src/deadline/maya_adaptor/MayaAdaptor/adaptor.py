@@ -49,6 +49,7 @@ _MAYA_INIT_KEYS = {
     "render_layer",
     "render_setup_include_lights",
     "cache_pathmapping",
+    "vrscene_pathmapping",
     "error_on_arnold_license_fail",
 }
 
@@ -90,7 +91,7 @@ class MayaAdaptor(Adaptor[AdaptorConfiguration]):
 
     @property
     def integration_data_interface_version(self) -> SemanticVersion:
-        return SemanticVersion(major=0, minor=2)
+        return SemanticVersion(major=0, minor=3)
 
     @staticmethod
     def _get_timer(timeout: int | float) -> Callable[[], bool]:
