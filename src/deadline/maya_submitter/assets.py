@@ -16,6 +16,31 @@ import maya.cmds
 
 _FRAME_RE = re.compile("#+")
 
+# Regex to extract string values from .vrscene plugin parameters.
+# Matches paramName="value"; capturing both the parameter name and value.
+# The vrscene format uses paramName="stringValue"; for string parameters.
+# Per the spec, there should be no whitespace around '=', but we allow it for robustness.
+_VRSCENE_NAMED_PARAM_RE = re.compile(r'(\w+)\s*=\s*"([^"]+)"\s*;')
+
+# Matches a complete plugin block: captures plugin type and block body.
+# Handles both multi-line and compact single-line blocks.
+# Uses re.DOTALL so '.' matches newlines within the non-greedy body match.
+_VRSCENE_PLUGIN_BLOCK_RE = re.compile(r'(\w+)\s+\S+\s*\{(.*?)\}', re.DOTALL)
+
+# Matches #include directives: #include "path/to/file.vrscene"
+_VRSCENE_INCLUDE_RE = re.compile(r'#include\s+"([^"]+)"')
+
+# Known vrscene plugin types and their attributes that contain file paths.
+# This covers the most common cases: textures, geometry proxies, IES lights, etc.
+_VRSCENE_FILE_PLUGINS: dict[str, set[str]] = {
+    "BitmapBuffer": {"file"},
+    "GeomMeshFile": {"file"},
+    "LightIES": {"ies_file"},
+    "TexPtex": {"ptex_file"},
+    "VRayScene": {"filepath"},
+    "PhxShaderCache": {"cache_path"},
+}
+
 
 class AssetIntrospector:
     def parse_scene_assets(self, progress_callback=None) -> set[Path]:
@@ -46,6 +71,11 @@ class AssetIntrospector:
             if progress_callback:
                 progress_callback("Searching for Renderman texture files...")
             assets.update(self._get_tex_files(progress_callback))
+
+        if Scene.renderer() == RendererNames.vray.value:
+            if progress_callback:
+                progress_callback("Searching for VRayScene linked files...")
+            assets.update(self._get_vrscene_linked_files(progress_callback))
 
         file_refs = list(FilePathEditor.fileRefs())
         total_refs = len(file_refs)
@@ -237,6 +267,195 @@ class AssetIntrospector:
                 progress_callback(f"Completed processing all {total_textures} Arnold texture files")
 
         return arnold_textures_files
+
+    def _get_vrscene_linked_files(self, progress_callback=None) -> set[Path]:
+        """
+        Finds all VRayScene nodes in the Maya scene, reads their referenced .vrscene files,
+        and parses those files to discover linked assets (textures, Alembic, VrayMesh, VDB, etc.).
+
+        Args:
+            progress_callback: Optional callback function for progress updates
+
+        Returns:
+            set[Path]: A set of file paths referenced inside .vrscene files
+        """
+        vrscene_assets: set[Path] = set()
+
+        # Find all VRayScene nodes in the Maya scene
+        vrscene_nodes = maya.cmds.ls(type="VRayScene") or []
+        if not vrscene_nodes:
+            return vrscene_assets
+
+        total_nodes = len(vrscene_nodes)
+        print(f"Processing {total_nodes} VRayScene node(s) for linked files")
+        if progress_callback:
+            progress_callback(f"Processing {total_nodes} VRayScene node(s) for linked files...")
+
+        for i, node in enumerate(vrscene_nodes):
+            # The .vrscene file path is stored in the "FilePath" attribute
+            if not maya.cmds.attributeQuery("FilePath", node=node, exists=True):
+                continue
+
+            vrscene_path = maya.cmds.getAttr(f"{node}.FilePath")
+            if not vrscene_path or not isinstance(vrscene_path, str):
+                continue
+
+            vrscene_path = vrscene_path.strip()
+            if not vrscene_path:
+                continue
+
+            # Resolve relative paths against the Maya project
+            if not os.path.isabs(vrscene_path):
+                vrscene_path = os.path.join(Scene.project_path(), vrscene_path)
+
+            vrscene_path = os.path.normpath(vrscene_path)
+
+            if not os.path.isfile(vrscene_path):
+                print(f"Warning: VRayScene file not found: {vrscene_path}")
+                continue
+
+            print(f"Parsing VRayScene file: {vrscene_path}")
+            if progress_callback:
+                progress_callback(f"Parsing VRayScene file ({i+1}/{total_nodes}): {vrscene_path}")
+
+            linked_files = self._parse_vrscene_file(vrscene_path)
+            vrscene_assets.update(linked_files)
+
+        if vrscene_assets:
+            print(f"Found {len(vrscene_assets)} linked file(s) in VRayScene files")
+            if progress_callback:
+                progress_callback(f"Found {len(vrscene_assets)} linked file(s) in VRayScene files")
+
+        return vrscene_assets
+
+    def _parse_vrscene_file(self, vrscene_path: str) -> set[Path]:
+        """
+        Parses a .vrscene file and extracts all referenced file paths.
+
+        The .vrscene format is text-based with plugin blocks like:
+            BitmapBuffer bitmapBuffer1 {
+                file="path/to/texture.exr";
+            }
+
+        Instead of parsing line-by-line, we read the entire file and use a single
+        regex pass to find all plugin blocks and extract string parameters from them.
+        This is significantly faster for large vrscene files that contain huge amounts
+        of geometry data (vertices, normals, faces) which we can skip entirely.
+
+        We use two strategies:
+        1. Targeted: Track known plugin types and their file attributes
+        2. Broad: For any string parameter value that looks like a file path with a
+           recognized extension, include it as well (catches custom/unknown plugins)
+
+        Args:
+            vrscene_path: Absolute path to the .vrscene file
+
+        Returns:
+            set[Path]: A set of resolved file paths found in the .vrscene file
+        """
+        linked_files: set[Path] = set()
+        vrscene_dir = os.path.dirname(vrscene_path)
+
+        # File extensions commonly referenced in vrscene files
+        _asset_extensions = {
+            ".exr",
+            ".hdr",
+            ".hdri",
+            ".tif",
+            ".tiff",
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".bmp",
+            ".tga",
+            ".tx",
+            ".tex",
+            ".rat",
+            ".abc",
+            ".vrmesh",
+            ".vdb",
+            ".obj",
+            ".ies",
+            ".vrscene",
+            ".osl",
+            ".oso",
+            ".vrmat",
+            ".vismat",
+        }
+
+        def _resolve_and_add(value: str) -> None:
+            """Resolve a file path value and add it to linked_files."""
+            file_path = value
+            if not os.path.isabs(file_path):
+                file_path = os.path.join(vrscene_dir, file_path)
+            file_path = os.path.normpath(file_path)
+
+            # Handle <UDIM> tokens by finding all matching tile files
+            if "<UDIM>" in file_path:
+                file_dir = os.path.dirname(file_path)
+                file_base = os.path.basename(file_path).split("<UDIM>")[0]
+                try:
+                    for f in os.listdir(file_dir):
+                        if f.startswith(file_base) and os.path.isfile(
+                            os.path.join(file_dir, f)
+                        ):
+                            linked_files.add(
+                                Path(os.path.normpath(os.path.join(file_dir, f)))
+                            )
+                except (OSError, FileNotFoundError):
+                    linked_files.add(Path(file_path))
+            elif os.path.exists(file_path):
+                linked_files.add(Path(file_path))
+            else:
+                # Still add it - the path might be valid on the render farm
+                # after path mapping
+                linked_files.add(Path(file_path))
+
+        try:
+            with open(vrscene_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except (OSError, IOError) as e:
+            print(f"Warning: Could not read VRayScene file {vrscene_path}: {e}")
+            return linked_files
+
+        # Strip single-line comments (// ...) before parsing.
+        # The vrscene format only supports C++ style single-line comments.
+        content = re.sub(r'//[^\n]*', '', content)
+
+        # Process #include directives
+        for include_match in _VRSCENE_INCLUDE_RE.finditer(content):
+            include_path = include_match.group(1)
+            if not os.path.isabs(include_path):
+                include_path = os.path.join(vrscene_dir, include_path)
+            include_path = os.path.normpath(include_path)
+            if os.path.isfile(include_path):
+                linked_files.add(Path(include_path))
+                linked_files.update(self._parse_vrscene_file(include_path))
+
+        # Single-pass: find all plugin blocks and extract string params from each
+        for block_match in _VRSCENE_PLUGIN_BLOCK_RE.finditer(content):
+            plugin_type = block_match.group(1)
+            block_body = block_match.group(2)
+
+            # Only run the param regex on blocks that could contain file references:
+            # either a known file-bearing plugin type, or a block whose body contains
+            # a quote character (string params use quotes, geometry data doesn't).
+            known_plugin = plugin_type in _VRSCENE_FILE_PLUGINS
+            if not known_plugin and '"' not in block_body:
+                continue
+
+            for param_name, value in _VRSCENE_NAMED_PARAM_RE.findall(block_body):
+                is_known_file_attr = (
+                    known_plugin and param_name in _VRSCENE_FILE_PLUGINS[plugin_type]
+                )
+
+                _, ext = os.path.splitext(value.lower())
+                has_asset_extension = ext in _asset_extensions
+
+                if is_known_file_attr or has_asset_extension:
+                    _resolve_and_add(value)
+
+        return linked_files
 
     def _get_arnold_texture_files(self) -> dict[str, Any]:
         """
