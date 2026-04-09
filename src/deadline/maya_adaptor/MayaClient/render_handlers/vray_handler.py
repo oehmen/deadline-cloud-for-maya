@@ -293,15 +293,29 @@ class VRayHandler(DefaultMayaHandler):
         original_content = content
 
         for source, dest in rules:
-            # Build all slash variants of the source path up front
-            variants = {source, source.replace("/", "\\"), source.replace("\\", "/")}
+            # Ensure consistent trailing separator handling.
+            # If source is "Z:\" and vrscene has "Z:/bib/...", replacing "Z:/" with
+            # "/dest/path" (no trailing /) would produce "/dest/pathbib/..." (missing separator).
+            # Normalize: strip trailing separators from both, then append "/" to both
+            # so the replacement is always "prefix/" -> "prefix/".
+            source_norm = source.rstrip("/\\")
+            dest_norm = dest.rstrip("/\\")
+
+            # Build all slash variants of the normalized source
+            variants = {
+                source_norm + "/",
+                source_norm.replace("/", "\\") + "\\",
+                source_norm.replace("\\", "/") + "/",
+            }
+            dest_with_sep = dest_norm + "/"
+
             for src_variant in variants:
                 if src_variant in content:
                     print(
-                        f"MayaClient: Replacing '{src_variant}' -> '{dest}' in {os.path.basename(vrscene_path)}",
+                        f"MayaClient: Replacing '{src_variant}' -> '{dest_with_sep}' in {os.path.basename(vrscene_path)}",
                         flush=True,
                     )
-                    content = content.replace(src_variant, dest)
+                    content = content.replace(src_variant, dest_with_sep)
 
         if content != original_content:
             try:
