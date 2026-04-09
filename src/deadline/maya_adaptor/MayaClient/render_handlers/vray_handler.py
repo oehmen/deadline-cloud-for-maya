@@ -209,7 +209,9 @@ class VRayHandler(DefaultMayaHandler):
             print("MayaClient: vrscene_pathmapping skipped: dirmap not activated", flush=True)
             return
 
-        rules = list(DirectoryMapping.mappings.items())
+        # Use the raw path mapping rules stored during set_path_mapping,
+        # not Maya's dirmap which may normalize/corrupt the paths on Linux.
+        rules = self._path_mapping_rules
         if not rules:
             print("MayaClient: vrscene_pathmapping skipped: no mapping rules", flush=True)
             return
