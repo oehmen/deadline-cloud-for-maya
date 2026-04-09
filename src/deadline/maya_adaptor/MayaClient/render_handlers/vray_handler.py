@@ -194,12 +194,12 @@ class VRayHandler(DefaultMayaHandler):
 
     def set_vrscene_pathmapping(self, data: dict) -> None:
         """
-        Applies path mapping rules to file paths inside .vrscene files in the
-        session's asset directories.
+        Applies path mapping rules to file paths inside .vrscene files referenced
+        by VRayScene nodes in the Maya scene.
 
         Maya's dirmap remaps the VRayScene node's FilePath attribute, but V-Ray's
         own parser reads the paths inside the vrscene file directly. This method
-        finds all .vrscene files in the session and rewrites those internal paths
+        finds the vrscene files via the nodes, then rewrites the internal paths
         using the Deadline path mapping rules before rendering.
 
         Args:
@@ -214,35 +214,60 @@ class VRayHandler(DefaultMayaHandler):
             print("MayaClient: vrscene_pathmapping skipped: no mapping rules", flush=True)
             return
 
-        # Find all .vrscene files under the session's asset roots by checking
-        # the destination paths from the mapping rules (these are the mount points
-        # where job attachments are downloaded).
-        import glob
-
-        vrscene_files: set[str] = set()
-        search_roots: set[str] = set()
-        for _, dest in rules:
-            if os.path.isdir(dest):
-                search_roots.add(dest)
-
-        for root in search_roots:
-            for vrscene_path in glob.glob(
-                os.path.join(root, "**", "*.vrscene"), recursive=True
-            ):
-                vrscene_files.add(os.path.normpath(vrscene_path))
-
-        if not vrscene_files:
-            print("MayaClient: vrscene_pathmapping: no .vrscene files found in asset roots", flush=True)
+        vrscene_nodes = maya.cmds.ls(type="VRayScene") or []
+        if not vrscene_nodes:
+            print("MayaClient: vrscene_pathmapping skipped: no VRayScene nodes", flush=True)
             return
 
-        print(
-            f"MayaClient: Applying path mapping to {len(vrscene_files)} vrscene file(s) "
-            f"with {len(rules)} rule(s)",
-            flush=True,
-        )
+        patched_files: set[str] = set()
 
-        for vrscene_path in sorted(vrscene_files):
-            self._remap_vrscene_file(vrscene_path, rules)
+        for node in vrscene_nodes:
+            if not maya.cmds.attributeQuery("FilePath", node=node, exists=True):
+                continue
+
+            raw_path = maya.cmds.getAttr(f"{node}.FilePath")
+            if not raw_path or not isinstance(raw_path, str):
+                continue
+            raw_path = raw_path.strip()
+            if not raw_path:
+                continue
+
+            # Convert through dirmap to get the actual Linux path
+            resolved_path = DirectoryMapping.convert(raw_path)
+
+            # Also try a manual conversion using the rules directly, in case
+            # dirmap doesn't convert (e.g. if the path was already converted)
+            if not os.path.isfile(resolved_path):
+                for source, dest in rules:
+                    for src_variant in (source, source.replace("\\", "/"), source.replace("/", "\\")):
+                        if raw_path.startswith(src_variant):
+                            resolved_path = dest + raw_path[len(src_variant):]
+                            resolved_path = resolved_path.replace("\\", "/")
+                            break
+                    if os.path.isfile(resolved_path):
+                        break
+
+            print(
+                f"MayaClient: VRayScene '{node}': '{raw_path}' -> '{resolved_path}'",
+                flush=True,
+            )
+
+            if not os.path.isfile(resolved_path):
+                print(
+                    f"MayaClient: Warning: vrscene file not found: {resolved_path}",
+                    flush=True,
+                )
+                continue
+
+            norm_path = os.path.normpath(resolved_path)
+            if norm_path in patched_files:
+                continue
+            patched_files.add(norm_path)
+
+            self._remap_vrscene_file(norm_path, rules)
+
+        if not patched_files:
+            print("MayaClient: vrscene_pathmapping: no vrscene files were patched", flush=True)
 
     @staticmethod
     def _remap_vrscene_file(vrscene_path: str, rules: list[tuple[str, str]]) -> None:
@@ -270,6 +295,10 @@ class VRayHandler(DefaultMayaHandler):
             variants = {source, source.replace("/", "\\"), source.replace("\\", "/")}
             for src_variant in variants:
                 if src_variant in content:
+                    print(
+                        f"MayaClient: Replacing '{src_variant}' -> '{dest}' in {os.path.basename(vrscene_path)}",
+                        flush=True,
+                    )
                     content = content.replace(src_variant, dest)
 
         if content != original_content:
