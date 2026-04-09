@@ -206,16 +206,25 @@ class VRayHandler(DefaultMayaHandler):
             data (dict): The data given from the Adaptor. Keys expected: []
         """
         if not DirectoryMapping.get_activated():
+            print("MayaClient: vrscene_pathmapping skipped: dirmap not activated", flush=True)
             return
 
         vrscene_nodes = maya.cmds.ls(type="VRayScene") or []
         if not vrscene_nodes:
+            print("MayaClient: vrscene_pathmapping skipped: no VRayScene nodes found", flush=True)
             return
 
         # Collect the mapping rules once
         rules = list(DirectoryMapping.mappings.items())
         if not rules:
+            print("MayaClient: vrscene_pathmapping skipped: no mapping rules", flush=True)
             return
+
+        print(
+            f"MayaClient: Applying path mapping to {len(vrscene_nodes)} VRayScene node(s) "
+            f"with {len(rules)} rule(s)",
+            flush=True,
+        )
 
         patched_files: set[str] = set()
 
@@ -223,13 +232,27 @@ class VRayHandler(DefaultMayaHandler):
             if not maya.cmds.attributeQuery("FilePath", node=node, exists=True):
                 continue
 
-            # Get the already-remapped path (dirmap applies to the attribute value)
-            vrscene_path = maya.cmds.getAttr(f"{node}.FilePath")
-            if not vrscene_path or not isinstance(vrscene_path, str):
+            raw_path = maya.cmds.getAttr(f"{node}.FilePath")
+            if not raw_path or not isinstance(raw_path, str):
                 continue
 
-            vrscene_path = vrscene_path.strip()
-            if not vrscene_path or not os.path.isfile(vrscene_path):
+            raw_path = raw_path.strip()
+            if not raw_path:
+                continue
+
+            # dirmap doesn't transparently change getAttr results — we need to
+            # explicitly convert the path through the mapping rules.
+            vrscene_path = DirectoryMapping.convert(raw_path)
+            print(
+                f"MayaClient: VRayScene node '{node}' FilePath: '{raw_path}' -> '{vrscene_path}'",
+                flush=True,
+            )
+
+            if not os.path.isfile(vrscene_path):
+                print(
+                    f"MayaClient: Warning: vrscene file not found after path mapping: {vrscene_path}",
+                    flush=True,
+                )
                 continue
 
             # Avoid patching the same file twice (multiple nodes can reference it)
