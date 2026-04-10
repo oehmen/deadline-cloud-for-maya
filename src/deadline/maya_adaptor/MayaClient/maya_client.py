@@ -35,6 +35,23 @@ class MayaClient(ClientInterface):
         import maya.standalone
         import maya.cmds
 
+        # Log license-related env vars before Maya initializes
+        # (this is the moment Maya checks the license)
+        _license_vars = [
+            "MAYA_LICENSE",
+            "ADSKFLEX_LICENSE_FILE",
+            "MAYA_LICENSE_METHOD",
+            "AUTODESK_ADLM_THINCLIENT_ENV",
+        ]
+        print("MayaClient: License environment at initialize():", flush=True)
+        for _var in _license_vars:
+            _val = os.environ.get(_var)
+            if _val is not None:
+                _display = _val if len(_val) <= 80 else _val[:77] + "..."
+                print(f"  {_var}={_display}", flush=True)
+            else:
+                print(f"  {_var}=<not set>", flush=True)
+
         maya.standalone.initialize()
         print(f"MayaClient: Maya Version {maya.cmds.about(version=True)}")
 
