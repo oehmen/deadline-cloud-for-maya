@@ -57,6 +57,7 @@ class DefaultMayaHandler:
         self.output_file_prefix = None
         self.render_kwargs = {}
         self._pending_ocio_path = None
+        self._path_mapping_rules: list[tuple[str, str]] = []
 
     def get_camera_to_render(self, data: dict) -> list[str]:
         # The ls function returns all of the camera shapes, but the cameras themselves are represented by
@@ -205,6 +206,10 @@ class DefaultMayaHandler:
         rules = data.get("path_mapping_rules", dict())
         if not rules:
             return
+
+        # Store the raw rules for use by renderer-specific path mapping (e.g. vrscene)
+        # before Maya's dirmap potentially normalizes them.
+        self._path_mapping_rules = list(rules.items())
 
         DirectoryMapping.set_activated(True)
         for source, dest in rules.items():

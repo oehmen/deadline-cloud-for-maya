@@ -87,6 +87,29 @@ class TestParseSceneAssets:
             any_order=True,
         )
 
+    def test_excludes_assets_under_declared_directories(
+        self,
+        yeti_files: List[Path],
+        fileRefs: List[FileRef],
+        scene_name: str,
+    ) -> None:
+        # GIVEN the file references live under /path/to/file, which the user has
+        # declared as an Input Directory and therefore wants excluded from detection.
+        progress_callback = MagicMock()
+
+        # WHEN that directory is passed as an exclusion root
+        results = assets_module.AssetIntrospector().parse_scene_assets(
+            progress_callback, exclude_dirs=["/path/to/file"]
+        )
+
+        # THEN none of the excluded file references are resolved...
+        for fileRef in fileRefs:
+            assert Path(fileRef.path) not in results
+        # ...but assets outside the excluded directory are still detected.
+        for f in yeti_files:
+            assert f in results
+        assert Path(scene_name) in results
+
     @patch.object(assets_module.AssetIntrospector, "_get_tx_files")
     def test_gets_arnold_texture_files(
         self,
@@ -525,9 +548,18 @@ def test_get_node_attr_paths(
     bifrost_node = MagicMock()
     bifrost_node_attrs = [f"{bifrost_node}.texture1", f"{bifrost_node}.texture2"]
 
-    mock_maya.cmds.ls.return_value = [file_node, bifrost_node]
-    mock_maya.cmds.listAttr.side_effect = [file_node_attrs, bifrost_node_attrs]
-    mock_maya.cmds.attributeQuery.side_effect = [False, True]
+    bifrost_type = "bifrostContainer"
+    # ls(showType=True) returns a flat [name, type, name, type, ...] list.
+    mock_maya.cmds.ls.return_value = [file_node, "file", bifrost_node, bifrost_type]
+
+    # Two-pass listAttr (probe without multi, then with multi) returns the same
+    # attrs per node regardless of the multi flag in this mock.
+    def _list_attr(node, **kwargs):
+        return file_node_attrs if node is file_node else bifrost_node_attrs
+
+    mock_maya.cmds.listAttr.side_effect = _list_attr
+    # absoluteCacheName is now resolved once per node *type* via attributeQuery(type=...).
+    mock_maya.cmds.attributeQuery.side_effect = lambda *a, **k: k.get("type") == bifrost_type
 
     mock_expand_tokens.side_effect = (
         lambda path, object_name: path.replace("<object>", str(object_name))
@@ -572,7 +604,13 @@ def test_get_node_attr_paths_excludes_vray_settings(mock_maya: MagicMock) -> Non
     regular_node = "regularNode"
 
     # Mock the nodes in the scene
-    mock_maya.cmds.ls.return_value = [vray_settings_node, regular_node]
+    # ls(showType=True) returns a flat [name, type, name, type, ...] list.
+    mock_maya.cmds.ls.return_value = [
+        vray_settings_node,
+        "VRaySettingsNode",
+        regular_node,
+        "transform",
+    ]
 
     # Mock attributes for vraySettings node (including excluded ones)
     vray_attrs = [
@@ -587,7 +625,12 @@ def test_get_node_attr_paths_excludes_vray_settings(mock_maya: MagicMock) -> Non
         "regularNode.cache_file",
     ]
 
-    mock_maya.cmds.listAttr.side_effect = [vray_attrs, regular_attrs]
+    # Two-pass listAttr (probe without multi, then with multi) returns the same
+    # attrs per node regardless of the multi flag in this mock.
+    def _list_attr(node, **kwargs):
+        return vray_attrs if node == vray_settings_node else regular_attrs
+
+    mock_maya.cmds.listAttr.side_effect = _list_attr
     mock_maya.cmds.attributeQuery.return_value = False  # No bifrost nodes
 
     # Mock attribute values
@@ -614,6 +657,63 @@ def test_get_node_attr_paths_excludes_vray_settings(mock_maya: MagicMock) -> Non
     # Verify that the excluded attributes were not processed
     assert "/path/to/memory/tracking" not in result
     assert "/path/to/time/tracking" not in result
+
+
+@patch.object(assets_module, "maya")
+def test_get_node_attr_paths_resolves_multi_filename_attrs(mock_maya: MagicMock) -> None:
+    """Regression: a multi filename attribute (e.g. file.explicitUvTiles[*].
+    explicitUvTileName for UDIM tiles) must be resolved via the *indexed* names from
+    the multi=True pass. The probe pass (no multi) returns the unindexed name, which
+    getAttr cannot resolve -- the two-pass logic must not getAttr that name."""
+    file_node = "file6"
+    # ls(showType=True) returns a flat [name, type, ...] list.
+    mock_maya.cmds.ls.return_value = [file_node, "file"]
+    mock_maya.cmds.attributeQuery.return_value = False  # no bifrost cache attr
+
+    unindexed = "file6.explicitUvTiles.explicitUvTileName"
+    indexed = "file6.explicitUvTiles[0].explicitUvTileName"
+
+    def _list_attr(node, **kwargs):
+        # With multi=True, Maya expands the multi to indexed element names.
+        return [indexed] if kwargs.get("multi") else [unindexed]
+
+    mock_maya.cmds.listAttr.side_effect = _list_attr
+
+    def _get_attr(attr):
+        if attr == indexed:
+            return "/tex/tile_1001.exr"
+        # The unindexed name is unresolvable -- mirrors the real Maya ValueError.
+        raise ValueError(f"No object matches name: {attr}")
+
+    mock_maya.cmds.getAttr.side_effect = _get_attr
+
+    # WHEN / THEN -- resolves via the indexed name, without raising.
+    result = assets_module.AssetIntrospector()._get_node_attr_paths(expand_tokens=False)
+    assert result == ["/tex/tile_1001.exr"]
+
+
+@patch.object(assets_module, "maya")
+def test_get_node_attr_paths_skips_geometry_shapes(mock_maya: MagicMock) -> None:
+    """mesh/nurbsSurface/subdiv shapes are skipped: listAttr is never called on them.
+    listAttr on a mesh is ~50ms regardless of flags and they expose no retrievable
+    file attributes, so skipping them is the performance fix."""
+    file_node = "file7"
+    mesh_node = "pSphereShape1"
+    # ls(showType=True): a file node (scanned) and a mesh (skipped).
+    mock_maya.cmds.ls.return_value = [file_node, "file", mesh_node, "mesh"]
+    mock_maya.cmds.attributeQuery.return_value = False  # no bifrost cache attr
+
+    def _list_attr(node, **kwargs):
+        if node == mesh_node:
+            raise AssertionError("listAttr must not be called on skipped geometry shapes")
+        return ["file7.fileTextureName"]
+
+    mock_maya.cmds.listAttr.side_effect = _list_attr
+    mock_maya.cmds.getAttr.side_effect = lambda attr: "/tex/diffuse.exr"
+
+    # WHEN / THEN — only the file node is processed; the mesh is skipped entirely.
+    result = assets_module.AssetIntrospector()._get_node_attr_paths(expand_tokens=False)
+    assert result == ["/tex/diffuse.exr"]
 
 
 class TestFlattenAndValidatePaths:

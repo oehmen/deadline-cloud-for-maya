@@ -39,6 +39,7 @@ EXPECTED_INIT_DATA_PROPERTIES = {
     "renderer": "arnold",
     "scene_file": "/path/to/scene.mb",
     "strict_error_checking": True,
+    "vrscene_pathmapping": True,
 }
 
 # Required fields for init_data schema
@@ -62,7 +63,7 @@ EXPECTED_RUN_DATA_REQUIRED = ["frame"]
 
 # Expected version - must be bumped when schemas change
 EXPECTED_SCHEMA_VERSION_MAJOR = 0
-EXPECTED_SCHEMA_VERSION_MINOR = 2
+EXPECTED_SCHEMA_VERSION_MINOR = 3
 
 
 @pytest.fixture()
@@ -571,7 +572,7 @@ class TestMayaAdaptor_on_start:
     def test_semantic_version(self, init_data: dict) -> None:
         """Tests that the adaptor semantic version is in the expected format"""
         adaptor = MayaAdaptor(init_data)
-        assert adaptor.integration_data_interface_version == SemanticVersion(major=0, minor=2)
+        assert adaptor.integration_data_interface_version == SemanticVersion(major=0, minor=3)
 
     def test_if_init_data_and_run_data_schema_are_changed_schema_version_is_bumped(
         self, init_data: dict

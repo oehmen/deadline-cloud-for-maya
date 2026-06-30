@@ -26,7 +26,8 @@
             ]
         },
         "scene_file": { "type": "string" },
-        "strict_error_checking": { "type": "boolean" }
+        "strict_error_checking": { "type": "boolean" },
+        "vrscene_pathmapping": { "type": "boolean" }
     },
     "required": [
         "project_path",
