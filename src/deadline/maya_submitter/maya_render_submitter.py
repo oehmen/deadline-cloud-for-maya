@@ -282,6 +282,10 @@ def _get_job_template(
                 "data"
             ] += "error_on_arnold_license_fail: {{Param.ArnoldErrorOnLicenseFailure}}\n"
 
+        # If the renderer is V-Ray, enable vrscene path mapping on the worker
+        if layer_data.renderer_name == "vray":
+            init_data["data"] += "vrscene_pathmapping: true\n"
+
     # If Arnold is one of the renderers, add Arnold-specific parameters
     if "arnold" in renderers:
         job_template["parameterDefinitions"].append(
@@ -935,6 +939,27 @@ def show_maya_render_submitter(
 ) -> Optional[SubmitJobToDeadlineDialog]:
     print("Starting Maya render submitter")
 
+    # Ask the artist whether to skip asset detection. On very large scenes the
+    # scene-wide scan can take many minutes; skipping it relies on the Input
+    # Directories declared in the Job Attachments tab instead.
+    skip_choice = maya.cmds.confirmDialog(
+        title="Deadline Cloud Submitter",
+        message=(
+            "Skip automatic asset detection?\n\n"
+            "Asset detection scans the whole scene for textures, caches and "
+            "references. On very large scenes this can take several minutes.\n\n"
+            "If you skip it, add your asset folders manually as Input Directories "
+            "in the Job Attachments tab. The scene file and render output "
+            "directories are still included automatically."
+        ),
+        button=["Run Asset Detection", "Skip Detection"],
+        defaultButton="Run Asset Detection",
+        cancelButton="Run Asset Detection",
+        dismissString="Run Asset Detection",
+    )
+    skip_asset_detection = skip_choice == "Skip Detection"
+    print(f"Asset detection {'skipped' if skip_asset_detection else 'enabled'} by user choice")
+
     # Create and show a progress dialog
     from qtpy.QtWidgets import QProgressDialog
     from qtpy.QtCore import Qt  # type: ignore
@@ -965,40 +990,57 @@ def show_maya_render_submitter(
     _populate_selectable_cameras(render_settings, render_layers)
 
     auto_detected_attachments = AssetReferences()
-    introspector = AssetIntrospector()
-    print(f"Asset introspector initialized at {time.time()}")
-    update_progress("Analyzing scene assets...")
-    scene_assets = list(introspector.parse_scene_assets(progress_callback=update_progress))
-    total_assets = len(scene_assets)
+    if skip_asset_detection:
+        # User opted out of the scene-wide scan. Still include the scene file
+        # itself (render output directories are added below); everything else is
+        # expected to come from the Input Directories declared in the dialog.
+        update_progress("Skipping asset detection...")
+        scene_file = Scene.name()
+        if scene_file and os.path.exists(scene_file):
+            auto_detected_attachments.input_filenames = {os.path.normpath(scene_file)}
+        print(f"Asset detection skipped at {time.time()}")
+    else:
+        introspector = AssetIntrospector()
+        print(f"Asset introspector initialized at {time.time()}")
+        update_progress("Analyzing scene assets...")
+        # Treat already-declared (sticky) Input Directories as exclusion roots: assets
+        # under a folder the user is uploading wholesale don't need to be scanned.
+        exclude_dirs = list(render_settings.input_directories)
+        scene_assets = list(
+            introspector.parse_scene_assets(
+                progress_callback=update_progress, exclude_dirs=exclude_dirs
+            )
+        )
+        total_assets = len(scene_assets)
 
-    # Update progress dialog with total assets
-    progress_dialog.setMaximum(total_assets)
-    progress_dialog.setValue(0)
+        # Update progress dialog with total assets
+        progress_dialog.setMaximum(total_assets)
+        progress_dialog.setValue(0)
 
-    # Process assets with progress updates
-    processed_files = set()
-    processed_directories = set()
-    print(f"Starting to process {total_assets} scene assets...")
+        # Process assets with progress updates
+        processed_files = set()
+        processed_directories = set()
+        print(f"Starting to process {total_assets} scene assets...")
 
-    for i, asset_path in enumerate(scene_assets):
-        progress_dialog.setValue(i)
-        normalized = os.path.normpath(asset_path)
-        if not os.path.exists(normalized):
-            continue
-        if os.path.isdir(normalized):
-            processed_directories.add(normalized)
-        else:
-            processed_files.add(normalized)
-        # Process in larger batches to improve performance - refresh UI every 100 assets
-        if i % 100 == 0 and i > 0:
-            print(f"Processed {i+1}/{total_assets} assets at {time.time()}")
-            update_progress(f"Processed {i+1}/{total_assets} assets")
+        for i, asset_path in enumerate(scene_assets):
+            progress_dialog.setValue(i)
+            normalized = os.path.normpath(asset_path)
+            if not os.path.exists(normalized):
+                continue
+            if os.path.isdir(normalized):
+                processed_directories.add(normalized)
+            else:
+                processed_files.add(normalized)
+            # Process in larger batches to improve performance - refresh UI every 100 assets
+            if i % 100 == 0 and i > 0:
+                print(f"Processed {i+1}/{total_assets} assets at {time.time()}")
+                update_progress(f"Processed {i+1}/{total_assets} assets")
 
-    progress_dialog.setValue(total_assets)
-    auto_detected_attachments.input_filenames = processed_files
-    auto_detected_attachments.input_directories = processed_directories
-    print(f"All {total_assets} assets processed at {time.time()}")
-    update_progress(f"All {total_assets} assets processed")
+        progress_dialog.setValue(total_assets)
+        auto_detected_attachments.input_filenames = processed_files
+        auto_detected_attachments.input_directories = processed_directories
+        print(f"All {total_assets} assets processed at {time.time()}")
+        update_progress(f"All {total_assets} assets processed")
 
     update_progress("Adding output directories...")
     for layer_data in render_layers:
