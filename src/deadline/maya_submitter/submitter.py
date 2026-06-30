@@ -617,6 +617,10 @@ class MayaSubmitter(BaseSubmitter):
                     "data"
                 ] += "error_on_arnold_license_fail: {{Param.ArnoldErrorOnLicenseFailure}}\n"
 
+            # If the renderer is V-Ray, enable vrscene path mapping on the worker
+            if layer_data.renderer_name == "vray":
+                init_data["data"] += "vrscene_pathmapping: true\n"
+
         # If Arnold is one of the renderers, add Arnold-specific parameters
         if "arnold" in renderers:
             job_template["parameterDefinitions"].append(

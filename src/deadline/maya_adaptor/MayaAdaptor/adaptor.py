@@ -48,6 +48,7 @@ _MAYA_INIT_KEYS = {
     "render_layer",
     "render_setup_include_lights",
     "cache_pathmapping",
+    "vrscene_pathmapping",
     "error_on_arnold_license_fail",
 }
 # Actions that must be queued before scene_file opens, but are optional
@@ -93,7 +94,7 @@ class MayaAdaptor(Adaptor[AdaptorConfiguration]):
 
     @property
     def integration_data_interface_version(self) -> SemanticVersion:
-        return SemanticVersion(major=0, minor=2)
+        return SemanticVersion(major=0, minor=3)
 
     @staticmethod
     def _get_timer(timeout: int | float) -> Callable[[], bool]:
@@ -457,8 +458,14 @@ class MayaAdaptor(Adaptor[AdaptorConfiguration]):
         for action_name in _FIRST_MAYA_ACTIONS:
             self._action_queue.enqueue_action(self._action_from_action_item(action_name))
 
+        # render_layer must be enqueued before other init keys so that
+        # render-layer overrides are applied first, and explicit settings
+        # (resolution, output prefix, output path) can then override them.
+        if "render_layer" in self.init_data:
+            self._action_queue.enqueue_action(self._action_from_action_item("render_layer"))
+
         for action_name in _MAYA_INIT_KEYS:
-            if action_name in self.init_data:
+            if action_name in self.init_data and action_name != "render_layer":
                 self._action_queue.enqueue_action(self._action_from_action_item(action_name))
 
         # RenderMan's texture manager bypasses Maya's dirmap, so we need to

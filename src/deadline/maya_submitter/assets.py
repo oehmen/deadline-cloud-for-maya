@@ -10,51 +10,120 @@ from typing import Any, Generator, Iterable
 
 from .file_path_editor import FilePathEditor
 from .scene import Animation, RendererNames, Scene
-from .utils import findAllFilesForPattern
+from .utils import clear_directory_cache, findAllFilesForPattern
 
 import maya.cmds
 
 _FRAME_RE = re.compile("#+")
 
+# Dense geometry *shape* node types skipped in _get_node_attr_paths. listAttr on
+# a mesh costs ~50 ms regardless of flags (usedAsFilename / multi / userDefined
+# were all measured ~equal on a 40k-node scene: ~620s total on `mesh` alone),
+# and they expose no retrievable file attributes — scanning meshes' user-defined
+# attrs produced a byte-identical asset set to skipping them. So skipping is
+# lossless here and cuts the scan from ~620s to ~2s. External files for these
+# workflows live on their own node types (gpuCache/AlembicNode for caches,
+# VRayProxy/VRayMesh for proxies, file/aiImage for textures), which are NOT
+# skipped. Conservative: only pure deformable-geometry shapes.
+_GEOMETRY_SHAPE_TYPES: set[str] = {"mesh", "nurbsSurface", "subdiv"}
+
+# Regex to extract string values from .vrscene plugin parameters.
+# Matches paramName="value"; capturing both the parameter name and value.
+# The vrscene format uses paramName="stringValue"; for string parameters.
+# Per the spec, there should be no whitespace around '=', but we allow it for robustness.
+_VRSCENE_NAMED_PARAM_RE = re.compile(r'(\w+)\s*=\s*"([^"]+)"\s*;')
+
+# Matches a complete plugin block: captures plugin type and block body.
+# Handles both multi-line and compact single-line blocks.
+# Uses re.DOTALL so '.' matches newlines within the non-greedy body match.
+_VRSCENE_PLUGIN_BLOCK_RE = re.compile(r"(\w+)\s+\S+\s*\{(.*?)\}", re.DOTALL)
+
+# Matches #include directives: #include "path/to/file.vrscene"
+_VRSCENE_INCLUDE_RE = re.compile(r'#include\s+"([^"]+)"')
+
+# Known vrscene plugin types and their attributes that contain file paths.
+# This covers the most common cases: textures, geometry proxies, IES lights, etc.
+_VRSCENE_FILE_PLUGINS: dict[str, set[str]] = {
+    "BitmapBuffer": {"file"},
+    "GeomMeshFile": {"file"},
+    "LightIES": {"ies_file"},
+    "TexPtex": {"ptex_file"},
+    "VRayScene": {"filepath"},
+    "PhxShaderCache": {"cache_path"},
+}
+
 
 class AssetIntrospector:
-    def parse_scene_assets(self, progress_callback=None) -> set[Path]:
+    def parse_scene_assets(self, progress_callback=None, exclude_dirs=None) -> set[Path]:
         """
         Searches the scene for assets, and filters out assets that are not needed for Rendering.
 
         Args:
             progress_callback: Optional callback function that takes a string argument for progress updates
+            exclude_dirs: Optional iterable of directory paths. Any discovered asset that
+                lives under one of these directories is skipped during detection, on the
+                assumption it is already covered by an Input Directory the user declared.
+                This avoids resolving/listing assets the user is uploading wholesale.
 
         Returns:
             set[Path]: A set containing filepaths of assets needed for Rendering
         """
         # clear filesystem cache from last run
         self._expand_path.cache_clear()
+        # clear the per-scan directory listing cache so we see current disk state
+        clear_directory_cache()
+
+        # Normalize the exclusion roots once. A path is excluded if it equals, or sits
+        # under, any of these directories (case-insensitive to match Windows semantics).
+        normalized_exclude_dirs = [
+            os.path.normcase(os.path.normpath(d)) for d in (exclude_dirs or []) if d
+        ]
+
+        def is_excluded(path) -> bool:
+            if not normalized_exclude_dirs:
+                return False
+            normalized = os.path.normcase(os.path.normpath(str(path)))
+            for excluded_root in normalized_exclude_dirs:
+                if normalized == excluded_root or normalized.startswith(excluded_root + os.sep):
+                    return True
+            return False
+
         # Grab tx files (if we need to)
         assets: set[Path] = set()
 
         # Grab any yeti files
         if progress_callback:
             progress_callback("Searching for Yeti cache files...")
-        assets.update(self._get_yeti_files(progress_callback))
+        assets.update(p for p in self._get_yeti_files(progress_callback) if not is_excluded(p))
 
         if Scene.renderer() == RendererNames.arnold.value:
             if progress_callback:
                 progress_callback("Searching for Arnold texture files...")
-            assets.update(self._get_tx_files(progress_callback))
+            assets.update(p for p in self._get_tx_files(progress_callback) if not is_excluded(p))
         elif Scene.renderer() == RendererNames.renderman.value:
             if progress_callback:
                 progress_callback("Searching for Renderman texture files...")
-            assets.update(self._get_tex_files(progress_callback))
+            assets.update(p for p in self._get_tex_files(progress_callback) if not is_excluded(p))
 
+        if Scene.renderer() == RendererNames.vray.value:
+            if progress_callback:
+                progress_callback("Searching for VRayScene linked files...")
+            assets.update(
+                p for p in self._get_vrscene_linked_files(progress_callback) if not is_excluded(p)
+            )
+
+        # Iterate the scene's file references (Maya's filePathEditor) and resolve each.
         file_refs = list(FilePathEditor.fileRefs())
         total_refs = len(file_refs)
-        print(f"Processing {total_refs} file references")
         if progress_callback:
             progress_callback(f"Processing {total_refs} file references...")
 
         for i, ref in enumerate(file_refs):
             normalized_path = os.path.normpath(ref.path)
+            # Skip references that live under a user-declared Input Directory; that
+            # directory is uploaded wholesale, so there's no need to resolve them.
+            if is_excluded(normalized_path):
+                continue
             # Files without tokens may already have been checked, if so, skip
             if normalized_path in assets:
                 continue
@@ -64,16 +133,16 @@ class AssetIntrospector:
             for path in self._expand_path(normalized_path):
                 assets.add(path)
             # Only refresh UI every 100 elements to improve performance
-            if i % 100 == 0:
-                print(f"Processed {i+1}/{total_refs} file references at {time.time()}")
-                if progress_callback:
-                    progress_callback(f"Processed {i+1}/{total_refs} file references...")
+            if i % 100 == 0 and progress_callback:
+                progress_callback(f"Processed {i+1}/{total_refs} file references...")
 
         # Iterate through every node and list all attributes that are filenames
         # Then replace all tokens and check if it's a real path
         # If it's not already in assets, add it to assets
         for path in self._get_node_attr_paths(expand_tokens=True):
             normalized_path = os.path.normpath(path)
+            if is_excluded(normalized_path):
+                continue
             frame_re_matches = _FRAME_RE.findall(normalized_path)
             if frame_re_matches or "<f>" in normalized_path or "<frame>" in normalized_path:
                 for expanded_path in self._expand_path(normalized_path):
@@ -238,6 +307,195 @@ class AssetIntrospector:
 
         return arnold_textures_files
 
+    def _get_vrscene_linked_files(self, progress_callback=None) -> set[Path]:
+        """
+        Finds all VRayScene nodes in the Maya scene, reads their referenced .vrscene files,
+        and parses those files to discover linked assets (textures, Alembic, VrayMesh, VDB, etc.).
+
+        Args:
+            progress_callback: Optional callback function for progress updates
+
+        Returns:
+            set[Path]: A set of file paths referenced inside .vrscene files
+        """
+        vrscene_assets: set[Path] = set()
+
+        # Find all VRayScene nodes in the Maya scene
+        vrscene_nodes = maya.cmds.ls(type="VRayScene") or []
+        if not vrscene_nodes:
+            return vrscene_assets
+
+        total_nodes = len(vrscene_nodes)
+        print(f"Processing {total_nodes} VRayScene node(s) for linked files")
+        if progress_callback:
+            progress_callback(f"Processing {total_nodes} VRayScene node(s) for linked files...")
+
+        for i, node in enumerate(vrscene_nodes):
+            # The .vrscene file path is stored in the "FilePath" attribute
+            if not maya.cmds.attributeQuery("FilePath", node=node, exists=True):
+                continue
+
+            vrscene_path = maya.cmds.getAttr(f"{node}.FilePath")
+            if not vrscene_path or not isinstance(vrscene_path, str):
+                continue
+
+            vrscene_path = vrscene_path.strip()
+            if not vrscene_path:
+                continue
+
+            # Resolve relative paths against the Maya project
+            if not os.path.isabs(vrscene_path):
+                vrscene_path = os.path.join(Scene.project_path(), vrscene_path)
+
+            vrscene_path = os.path.normpath(vrscene_path)
+
+            if not os.path.isfile(vrscene_path):
+                print(f"Warning: VRayScene file not found: {vrscene_path}")
+                continue
+
+            print(f"Parsing VRayScene file: {vrscene_path}")
+            if progress_callback:
+                progress_callback(f"Parsing VRayScene file ({i+1}/{total_nodes}): {vrscene_path}")
+
+            linked_files = self._parse_vrscene_file(vrscene_path)
+            vrscene_assets.update(linked_files)
+
+        if vrscene_assets:
+            print(f"Found {len(vrscene_assets)} linked file(s) in VRayScene files")
+            if progress_callback:
+                progress_callback(f"Found {len(vrscene_assets)} linked file(s) in VRayScene files")
+
+        return vrscene_assets
+
+    def _parse_vrscene_file(self, vrscene_path: str) -> set[Path]:
+        """
+        Parses a .vrscene file and extracts all referenced file paths.
+
+        The .vrscene format is text-based with plugin blocks like:
+            BitmapBuffer bitmapBuffer1 {
+                file="path/to/texture.exr";
+            }
+
+        Instead of parsing line-by-line, we read the entire file and use a single
+        regex pass to find all plugin blocks and extract string parameters from them.
+        This is significantly faster for large vrscene files that contain huge amounts
+        of geometry data (vertices, normals, faces) which we can skip entirely.
+
+        We use two strategies:
+        1. Targeted: Track known plugin types and their file attributes
+        2. Broad: For any string parameter value that looks like a file path with a
+           recognized extension, include it as well (catches custom/unknown plugins)
+
+        Args:
+            vrscene_path: Absolute path to the .vrscene file
+
+        Returns:
+            set[Path]: A set of resolved file paths found in the .vrscene file
+        """
+        linked_files: set[Path] = set()
+        vrscene_dir = os.path.dirname(vrscene_path)
+
+        # File extensions commonly referenced in vrscene files
+        _asset_extensions = {
+            ".exr",
+            ".hdr",
+            ".hdri",
+            ".tif",
+            ".tiff",
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".bmp",
+            ".tga",
+            ".tx",
+            ".tex",
+            ".rat",
+            ".abc",
+            ".vrmesh",
+            ".vdb",
+            ".obj",
+            ".ies",
+            ".vrscene",
+            ".osl",
+            ".oso",
+            ".vrmat",
+            ".vismat",
+        }
+
+        def _resolve_and_add(value: str) -> None:
+            """Resolve a file path value and add it to linked_files."""
+            file_path = value
+            if not os.path.isabs(file_path):
+                file_path = os.path.join(vrscene_dir, file_path)
+            file_path = os.path.normpath(file_path)
+
+            # Handle <UDIM> tokens by finding all matching tile files
+            if "<UDIM>" in file_path:
+                file_dir = os.path.dirname(file_path)
+                file_base = os.path.basename(file_path).split("<UDIM>")[0]
+                try:
+                    for f in os.listdir(file_dir):
+                        if f.startswith(file_base) and os.path.isfile(os.path.join(file_dir, f)):
+                            linked_files.add(Path(os.path.normpath(os.path.join(file_dir, f))))
+                except (OSError, FileNotFoundError):
+                    linked_files.add(Path(file_path))
+            elif os.path.exists(file_path):
+                linked_files.add(Path(file_path))
+            else:
+                # Still add it - the path might be valid on the render farm
+                # after path mapping
+                linked_files.add(Path(file_path))
+
+        try:
+            with open(vrscene_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except (OSError, IOError) as e:
+            print(f"Warning: Could not read VRayScene file {vrscene_path}: {e}")
+            return linked_files
+
+        # Strip single-line comments (// ...) before parsing.
+        # The vrscene format only supports C++ style single-line comments.
+        # Only strip // when it appears outside of quoted strings — UNC paths
+        # like //server/share/path start with // and must not be removed.
+        # Comments in vrscene files appear at the start of a line (with optional
+        # leading whitespace), never inside parameter values.
+        content = re.sub(r"^(\s*//.*)$", "", content, flags=re.MULTILINE)
+
+        # Process #include directives
+        for include_match in _VRSCENE_INCLUDE_RE.finditer(content):
+            include_path = include_match.group(1)
+            if not os.path.isabs(include_path):
+                include_path = os.path.join(vrscene_dir, include_path)
+            include_path = os.path.normpath(include_path)
+            if os.path.isfile(include_path):
+                linked_files.add(Path(include_path))
+                linked_files.update(self._parse_vrscene_file(include_path))
+
+        # Single-pass: find all plugin blocks and extract string params from each
+        for block_match in _VRSCENE_PLUGIN_BLOCK_RE.finditer(content):
+            plugin_type = block_match.group(1)
+            block_body = block_match.group(2)
+
+            # Only run the param regex on blocks that could contain file references:
+            # either a known file-bearing plugin type, or a block whose body contains
+            # a quote character (string params use quotes, geometry data doesn't).
+            known_plugin = plugin_type in _VRSCENE_FILE_PLUGINS
+            if not known_plugin and '"' not in block_body:
+                continue
+
+            for param_name, value in _VRSCENE_NAMED_PARAM_RE.findall(block_body):
+                is_known_file_attr = (
+                    known_plugin and param_name in _VRSCENE_FILE_PLUGINS[plugin_type]
+                )
+
+                _, ext = os.path.splitext(value.lower())
+                has_asset_extension = ext in _asset_extensions
+
+                if is_known_file_attr or has_asset_extension:
+                    _resolve_and_add(value)
+
+        return linked_files
+
     def _get_arnold_texture_files(self) -> dict[str, Any]:
         """
         Imports inner Arnold functions to get list of textures.
@@ -323,16 +581,59 @@ class AssetIntrospector:
                 "vraySettings.sys_time_tracking_output_dir",
             }
         }
-        for node in maya.cmds.ls():
+
+        # Enumerate nodes together with their types in a single Maya call.
+        # ls(showType=True) returns a flat [name, type, name, type, ...] list.
+        nodes_with_types = maya.cmds.ls(showType=True) or []
+        node_names = nodes_with_types[0::2]
+        node_types = nodes_with_types[1::2]
+
+        # Bifrost simulation caches use the "absoluteCacheName" attribute, which is not
+        # flagged usedAsFilename, so listAttr won't surface it. Probing every node with a
+        # per-node attributeQuery is one Maya round-trip per node, which dominates runtime
+        # on heavy scenes. Instead resolve, once per distinct node type, whether that type
+        # declares the attribute (attributeQuery supports querying by node type), then only
+        # add it for nodes of those types. For any node type that cannot be queried by type,
+        # fall back to a per-node check for just those (rare) nodes so nothing is missed.
+        type_has_cache_attr: dict[str, bool] = {}
+        types_needing_per_node_check: set[str] = set()
+        for node_type in set(node_types):
+            try:
+                type_has_cache_attr[node_type] = bool(
+                    maya.cmds.attributeQuery("absoluteCacheName", type=node_type, exists=True)
+                )
+            except Exception:
+                type_has_cache_attr[node_type] = False
+                types_needing_per_node_check.add(node_type)
+
+        for node, node_type in zip(node_names, node_types):
+            # Skip dense geometry shapes. listAttr on a mesh costs ~50 ms regardless of
+            # flags (usedAsFilename / multi / userDefined all measured ~equal) and they
+            # expose no retrievable file attributes -- scanning vs skipping them produced
+            # a byte-identical asset set on a 40k-node scene, while cutting the node scan
+            # from ~620s to ~2s. External files for these workflows live on their own node
+            # types (gpuCache/AlembicNode, VRayProxy/VRayMesh, file/aiImage), NOT skipped.
+            if node_type in _GEOMETRY_SHAPE_TYPES:
+                continue
+
+            # multi=True is required so multi filename attrs (e.g. file nodes'
+            # explicitUvTiles[*].explicitUvTileName for UDIM tiles) expand to indexed
+            # element names that getAttr can resolve; without it getAttr raises
+            # "No object matches name" on the unindexed compound child.
             attrs: list[str] = maya.cmds.listAttr(
                 node, usedAsFilename=True, fullNodeName=True, multi=True
             )
-            # We need to make sure we're including Bifrost caches, but listAttr won't find them
-            # Bifrost simulation caches use the "absoluteCacheName" attribute, which is not marked with "usedAsFilename"
-            if maya.cmds.attributeQuery("absoluteCacheName", node=node, exists=True):
+
+            has_cache_attr = type_has_cache_attr.get(node_type, False)
+            if not has_cache_attr and node_type in types_needing_per_node_check:
+                has_cache_attr = bool(
+                    maya.cmds.attributeQuery("absoluteCacheName", node=node, exists=True)
+                )
+            if has_cache_attr:
                 if attrs is None:
                     attrs = []
                 attrs.append("%s.absoluteCacheName" % node)
+
             if attrs is not None:
                 if excluded_attrs := excluded_attrs_by_node.get(str(node), set()):
                     attrs = [attr for attr in attrs if attr not in excluded_attrs]
