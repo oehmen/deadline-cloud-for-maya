@@ -94,22 +94,9 @@ class VRayHandler(DefaultMayaHandler):
             maya.cmds.setAttr("vraySettings.height", self.image_height)
             print(f"Set image height to {self.image_height}", flush=True)
 
-        # Ensure V-Ray renders at full resolution by locking the aspect ratio
-        # and disabling any resolution scale/percentage override.
-        # The "imgOpt_ratio" attribute controls the lock icon next to the
-        # resolution fields in V-Ray's render settings.  When it is not set
-        # to "locked" (1), V-Ray may apply a fractional multiplier to the
-        # width/height (e.g. 25% preview mode in the VFB), which silently
-        # reduces the output resolution during batch rendering.
-        for attr in ("imgOpt_ratio",):
-            if maya.cmds.attributeQuery(attr, node="vraySettings", exists=True):
-                current = maya.cmds.getAttr(f"vraySettings.{attr}")
-                if current != 1:
-                    maya.cmds.setAttr(f"vraySettings.{attr}", 1)
-                    print(
-                        f"MayaClient: Reset vraySettings.{attr} from {current} to 1 (locked).",
-                        flush=True,
-                    )
+        # Ensure V-Ray renders at the full submitted resolution, ignoring any
+        # VFB "Test resolution" preview scale that was saved in the scene.
+        self._disable_vfb_test_resolution()
 
         # Also sync Maya's defaultResolution so that any code path that reads
         # the standard Maya resolution attributes gets the correct values.
@@ -193,6 +180,35 @@ class VRayHandler(DefaultMayaHandler):
 
         maya.cmds.vrend(**self.render_kwargs)
         print(f"MayaClient: Finished Rendering Frame {frame}\n", flush=True)
+
+    def _disable_vfb_test_resolution(self) -> None:
+        """
+        Disables the V-Ray Frame Buffer "Test resolution" feature so the frame
+        renders at the full submitted resolution.
+
+        The VFB "Test resolution" option renders at a fraction of the image
+        resolution (indices 0-7 -> 10/25/50/75/100/110/125/150 %). Artists enable
+        it for fast preview renders and the state is saved in the scene. It is a
+        VFB setting, not a vraySettings attribute, so setting vraySettings.width /
+        vraySettings.height does not override it, and it is honoured even during
+        batch rendering -- silently scaling the output (e.g. a submitted
+        1080x1080 comes out 540x540 at 50%). It can only be reset via the
+        "vray vfbControl" command, which is supported in batch/headless mode.
+        """
+        try:
+            # Disabling the option is enough to render at 100%. Note: setting the
+            # "-testresolution" index instead would implicitly re-enable it.
+            maya.cmds.vray("vfbControl", "-testresolutionenabled", 0)
+            print(
+                "MayaClient: Disabled V-Ray VFB 'Test resolution' to render at the "
+                "full submitted resolution.",
+                flush=True,
+            )
+        except Exception as e:  # noqa: BLE001 - vray/vfbControl may be unavailable
+            print(
+                f"MayaClient: Warning: could not disable V-Ray VFB test resolution: {e}",
+                flush=True,
+            )
 
     def set_output_file_prefix(self, data: dict) -> None:
         """
