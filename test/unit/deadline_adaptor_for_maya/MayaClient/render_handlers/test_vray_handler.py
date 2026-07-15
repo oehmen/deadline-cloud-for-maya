@@ -47,6 +47,31 @@ class TestVrayHandler:
         # THEN
         assert handler.image_width == args["image_width"]
 
+    @patch("deadline.maya_adaptor.MayaClient.render_handlers.vray_handler.maya.cmds")
+    def test_disable_vfb_test_resolution(self, mock_cmds) -> None:
+        """The VFB 'Test resolution' preview scale must be turned off before rendering
+        so the worker renders at the full submitted resolution (see issue #386)."""
+        # GIVEN
+        handler = VRayHandler()
+
+        # WHEN
+        handler._disable_vfb_test_resolution()
+
+        # THEN
+        mock_cmds.vray.assert_called_once_with("vfbControl", "-testresolutionenabled", 0)
+
+    @patch("deadline.maya_adaptor.MayaClient.render_handlers.vray_handler.maya.cmds")
+    def test_disable_vfb_test_resolution_swallows_errors(self, mock_cmds) -> None:
+        """vfbControl may be unavailable in some contexts; failing to reset it must
+        not abort the render."""
+        # GIVEN
+        handler = VRayHandler()
+        mock_cmds.vray.side_effect = RuntimeError("VFB not available")
+
+        # WHEN / THEN (must not raise)
+        handler._disable_vfb_test_resolution()
+        mock_cmds.vray.assert_called_once_with("vfbControl", "-testresolutionenabled", 0)
+
     @patch.object(maya.cmds, "pluginInfo")
     def test_no_vray(self, plguinInfo) -> None:
         """Tests that setting the image width sets the right render kwarg"""
