@@ -7,6 +7,7 @@ import maya.cmds
 
 from .cameras import get_renderable_camera_names
 from .render_layers import get_all_renderable_render_layer_names
+from .scene import RendererNames
 
 
 def get_width() -> int:
@@ -26,49 +27,42 @@ def get_height() -> int:
 _LAYER_TOKENS = ("<Layer>", "<RenderLayer>", "%l")
 _CAMERA_TOKENS = ("<Camera>", "%c")
 
+# The attribute most renderers read for the output file name prefix.
+_DEFAULT_PREFIX_ATTRIBUTE = "defaultRenderGlobals.imageFilePrefix"
 
-def _get_current_renderer() -> str:
-    """
-    Returns the active renderer as recorded in the scene (e.g. "vray"), or "" if unknown.
-    """
-    try:
-        return maya.cmds.getAttr("defaultRenderGlobals.currentRenderer") or ""
-    except Exception:
-        return ""
+# Renderers that store their output file name prefix somewhere other than
+# defaultRenderGlobals.imageFilePrefix. V-Ray's Render Settings Common tab writes the
+# "File Name Prefix" field to vraySettings.fileNamePrefix and does not update the legacy
+# defaultRenderGlobals attribute, so reading the default attribute for a V-Ray scene picks
+# up a stale/empty value and the submitted job ignores the prefix the user configured.
+_RENDERER_PREFIX_ATTRIBUTES = {
+    RendererNames.vray.value: "vraySettings.fileNamePrefix",
+}
 
 
-def _get_vray_file_name_prefix() -> str:
+def _get_prefix_attribute() -> str:
     """
-    Returns the V-Ray output filename prefix (``vraySettings.fileNamePrefix``), or "".
+    Returns the attribute holding the output file name prefix for the scene's current
+    renderer, falling back to the default attribute when the renderer-specific node is
+    unavailable (e.g. the renderer plugin is not loaded).
+    """
+    renderer = maya.cmds.getAttr("defaultRenderGlobals.currentRenderer")
+    prefix_attribute = _RENDERER_PREFIX_ATTRIBUTES.get(renderer, _DEFAULT_PREFIX_ATTRIBUTE)
 
-    V-Ray does not use ``defaultRenderGlobals.imageFilePrefix``; it stores the artist's
-    configured output prefix on the ``vraySettings`` node. The node may not exist (e.g.
-    V-Ray not loaded), so this is guarded.
-    """
-    try:
-        if not maya.cmds.objExists("vraySettings"):
-            return ""
-        return maya.cmds.getAttr("vraySettings.fileNamePrefix") or ""
-    except Exception:
-        return ""
+    # Guard against the renderer-specific node not existing; otherwise getAttr would raise
+    # during submission.
+    node = prefix_attribute.split(".", 1)[0]
+    if not maya.cmds.objExists(node):
+        return _DEFAULT_PREFIX_ATTRIBUTE
+
+    return prefix_attribute
 
 
 def _get_base_output_prefix():
     """
     Retrieves the output prefix as specified in the scene.
-
-    The prefix source is renderer-aware: V-Ray keeps its filename prefix on
-    ``vraySettings.fileNamePrefix`` rather than ``defaultRenderGlobals.imageFilePrefix``
-    (which is typically empty for a V-Ray scene). For a V-Ray scene we therefore prefer the
-    V-Ray prefix so the artist's configured naming is respected, falling back to the standard
-    render-globals prefix and finally to the ``<Scene>`` default.
     """
-    if _get_current_renderer() == "vray":
-        vray_prefix = _get_vray_file_name_prefix()
-        if vray_prefix:
-            return vray_prefix
-
-    prefix = maya.cmds.getAttr("defaultRenderGlobals.imageFilePrefix")
+    prefix = maya.cmds.getAttr(_get_prefix_attribute())
     if prefix:
         return prefix
     return "<Scene>"
